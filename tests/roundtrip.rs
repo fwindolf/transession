@@ -53,7 +53,19 @@ fn detects_and_imports_current_codex_fixture() {
         session.metadata.session_id,
         "019d5294-7fd5-7e21-bcca-32362218c185"
     );
-    assert_eq!(session.metadata.model.as_deref(), Some("openai"));
+    assert_eq!(session.metadata.model.as_deref(), Some("gpt-5.6"));
+    assert_eq!(
+        session
+            .metadata
+            .extra
+            .get("codex_model_provider")
+            .and_then(|value| value.as_str()),
+        Some("OpenAI")
+    );
+    assert_eq!(
+        session.metadata.platform_version.as_deref(),
+        Some("0.144.6")
+    );
     assert!(
         session
             .events
@@ -72,6 +84,9 @@ fn detects_and_imports_current_codex_fixture() {
             .iter()
             .any(|event| matches!(event, SessionEvent::ToolResult(_)))
     );
+    assert!(session.events.iter().any(|event| {
+        matches!(event, SessionEvent::ToolCall(call) if call.name == "exec" && call.arguments.is_string())
+    }));
 }
 
 #[test]
@@ -112,7 +127,11 @@ fn detects_and_imports_current_claude_fixture() {
         session.metadata.session_id,
         "63679569-7045-45ba-bfef-cad8b1045769"
     );
-    assert_eq!(session.metadata.platform_version.as_deref(), Some("2.1.91"));
+    assert_eq!(
+        session.metadata.platform_version.as_deref(),
+        Some("2.1.215")
+    );
+    assert_eq!(session.metadata.model.as_deref(), Some("claude-opus-4.8"));
     assert!(
         session
             .events
@@ -124,12 +143,31 @@ fn detects_and_imports_current_claude_fixture() {
         .iter()
         .filter(|event| matches!(event, SessionEvent::Message(_)))
         .count();
-    assert_eq!(message_count, 2);
+    assert_eq!(message_count, 3);
+    assert!(
+        session
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ToolCall(_)))
+    );
+    assert!(
+        session
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ToolResult(_)))
+    );
+    assert!(!session.events.iter().any(|event| {
+        matches!(event, SessionEvent::Message(message) if message.blocks.iter().any(|block| block.text.as_deref().is_some_and(|text| text.contains("Internal command output"))))
+    }));
 }
 
 #[test]
 fn materializes_canonical_codex_layout() {
-    let session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let session = load_session(
+        &fixture("claude_current_sample.jsonl"),
+        SourceFormat::Claude,
+    )
+    .unwrap();
     let temp = tempdir().unwrap();
     let sqlite = temp.path().join("state_5.sqlite");
     let connection = Connection::open(&sqlite).unwrap();
@@ -181,7 +219,12 @@ fn materializes_canonical_codex_layout() {
         .unwrap();
     assert_eq!(id, session.metadata.session_id);
     assert_eq!(title, id);
-    assert!(first_user_message.contains("continuous-codex.sh"));
+    assert_eq!(first_user_message, "Inspect README.md");
+
+    let text = fs::read_to_string(path).unwrap();
+    assert!(text.contains("\"type\":\"input_image\""));
+    assert!(text.contains("\"name\":\"Read\""));
+    assert!(text.contains("\"cli_version\":\"0.144.6\""));
 }
 
 #[test]
@@ -213,7 +256,10 @@ fn materialized_codex_sessions_include_turn_events() {
                 first_user_message TEXT NOT NULL DEFAULT '',
                 agent_nickname TEXT,
                 agent_role TEXT,
-                memory_mode TEXT NOT NULL DEFAULT 'enabled'
+                memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                thread_source TEXT,
+                preview TEXT NOT NULL DEFAULT '',
+                history_mode TEXT NOT NULL DEFAULT 'legacy'
             );",
         )
         .unwrap();
@@ -291,7 +337,7 @@ fn materialized_codex_sessions_include_turn_events() {
             },
         );
     assert_eq!(type_counts.get("session_meta"), Some(&1));
-    assert_eq!(type_counts.get("turn_context"), Some(&2));
+    assert_eq!(type_counts.get("turn_context"), None);
     assert_eq!(type_counts.get("event_msg"), Some(&9));
 
     let session_meta = lines
@@ -303,19 +349,39 @@ fn materialized_codex_sessions_include_turn_events() {
             .get("payload")
             .and_then(|value| value.get("model_provider"))
             .and_then(|value| value.as_str()),
-        Some("imported")
+        Some("OpenAI")
+    );
+    assert_eq!(
+        session_meta
+            .get("payload")
+            .and_then(|value| value.get("cli_version"))
+            .and_then(|value| value.as_str()),
+        Some("0.144.6")
+    );
+    assert_eq!(
+        session_meta
+            .get("payload")
+            .and_then(|value| value.get("history_mode"))
+            .and_then(|value| value.as_str()),
+        Some("legacy")
+    );
+    assert!(
+        session_meta
+            .get("payload")
+            .and_then(|value| value.get("base_instructions"))
+            .is_none()
     );
 
-    let turn_context = lines
-        .iter()
-        .find(|value| value.get("type").and_then(|value| value.as_str()) == Some("turn_context"))
+    let (preview, thread_source, history_mode): (String, String, String) = connection
+        .query_row(
+            "SELECT preview, thread_source, history_mode FROM threads LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .unwrap();
-    let turn_payload = turn_context.get("payload").unwrap();
-    assert!(turn_payload.get("model").is_none());
-    assert_eq!(
-        turn_payload.get("collaboration_mode"),
-        Some(&serde_json::json!({ "mode": "default" }))
-    );
+    assert_eq!(preview, "First prompt");
+    assert_eq!(thread_source, "user");
+    assert_eq!(history_mode, "legacy");
 
     let event_types = lines
         .iter()
@@ -342,7 +408,8 @@ fn materialized_codex_sessions_include_turn_events() {
 
 #[test]
 fn materializes_canonical_claude_layout() {
-    let session = load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let session =
+        load_session(&fixture("codex_current_sample.jsonl"), SourceFormat::Codex).unwrap();
     let temp = tempdir().unwrap();
     let path = materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
 
@@ -351,17 +418,61 @@ fn materializes_canonical_claude_layout() {
     let history = temp.path().join("history.jsonl");
     assert!(history.exists());
     let text = fs::read_to_string(path).unwrap();
-    assert!(!text.contains("\"type\":\"input_text\""));
-    assert!(!text.contains("\"type\":\"output_text\""));
+    let mut saw_image = false;
+    let mut saw_freeform_tool = false;
+    let mut saw_structured_tool_result = false;
     for line in text.lines() {
         let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            value.get("version").and_then(|value| value.as_str()),
+            Some("2.1.215")
+        );
+        assert_eq!(
+            value.get("entrypoint").and_then(|value| value.as_str()),
+            Some("cli")
+        );
         if let Some(message) = value.get("message") {
             assert!(message.get("content").unwrap().is_array());
             if value.get("type").and_then(|value| value.as_str()) == Some("assistant") {
                 assert!(message.get("model").is_none());
             }
+            for block in message
+                .get("content")
+                .and_then(|value| value.as_array())
+                .unwrap()
+            {
+                assert!(!matches!(
+                    block.get("type").and_then(|value| value.as_str()),
+                    Some("input_text" | "output_text")
+                ));
+                match block.get("type").and_then(|value| value.as_str()) {
+                    Some("image") => saw_image = true,
+                    Some("tool_use")
+                        if block.get("name").and_then(|value| value.as_str()) == Some("exec") =>
+                    {
+                        assert!(block.get("input").is_some_and(|value| value.is_object()));
+                        saw_freeform_tool = true;
+                    }
+                    Some("tool_result") => {
+                        let content = block.get("content").unwrap();
+                        if let Some(items) = content.as_array() {
+                            assert!(items.iter().all(|item| {
+                                matches!(
+                                    item.get("type").and_then(|value| value.as_str()),
+                                    Some("text" | "image" | "document")
+                                )
+                            }));
+                            saw_structured_tool_result = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
+    assert!(saw_image);
+    assert!(saw_freeform_tool);
+    assert!(saw_structured_tool_result);
 }
 
 #[test]

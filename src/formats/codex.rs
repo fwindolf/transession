@@ -14,6 +14,9 @@ use crate::ir::{
     ToolCallEvent, ToolResultEvent, UniversalSession,
 };
 
+const CODEX_CLI_VERSION: &str = "0.144.6";
+const CODEX_MODEL_PROVIDER: &str = "OpenAI";
+
 pub struct CodexMaterialization {
     pub session_file: PathBuf,
     pub session_index: Option<PathBuf>,
@@ -84,11 +87,6 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .or_else(|| metadata.cwd.clone());
-    metadata.model = payload
-        .get("model_provider")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| metadata.model.clone());
     metadata.platform_version = payload
         .get("cli_version")
         .and_then(Value::as_str)
@@ -99,6 +97,11 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
         metadata
             .extra
             .insert("codex_source".to_string(), source.clone());
+    }
+    if let Some(model_provider) = payload.get("model_provider") {
+        metadata
+            .extra
+            .insert("codex_model_provider".to_string(), model_provider.clone());
     }
     if let Some(originator) = payload.get("originator") {
         metadata
@@ -128,11 +131,8 @@ fn import_turn_context(metadata: &mut SessionMetadata, value: &Value) {
         .map(PathBuf::from)
         .or_else(|| metadata.cwd.clone());
 
-    if metadata.model.is_none() {
-        metadata.model = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+    if let Some(model) = payload.get("model").and_then(Value::as_str) {
+        metadata.model = Some(model.to_string());
     }
 
     if let Some(personality) = payload.get("personality") {
@@ -176,8 +176,10 @@ fn import_response_item(events: &mut Vec<SessionEvent>, value: &Value) {
     match payload_type {
         "message" => import_message(events, payload, timestamp),
         "reasoning" => import_reasoning(events, payload, timestamp),
-        "function_call" => import_tool_call(events, payload, timestamp),
-        "function_call_output" => import_tool_result(events, payload, timestamp),
+        "function_call" | "custom_tool_call" => import_tool_call(events, payload, timestamp),
+        "function_call_output" | "custom_tool_call_output" => {
+            import_tool_result(events, payload, timestamp)
+        }
         _ => {}
     }
 }
@@ -267,8 +269,11 @@ fn import_tool_call(
 
     let arguments = payload_object
         .get("arguments")
-        .and_then(Value::as_str)
-        .map(parse_jsonish)
+        .or_else(|| payload_object.get("input"))
+        .map(|value| match value {
+            Value::String(value) => parse_jsonish(value),
+            value => value.clone(),
+        })
         .unwrap_or(Value::Null);
 
     events.push(SessionEvent::ToolCall(ToolCallEvent {
@@ -308,7 +313,10 @@ fn import_tool_result(
         .unwrap_or(Value::String(String::new()));
 
     events.push(SessionEvent::ToolResult(ToolResultEvent {
-        id: None,
+        id: payload_object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         parent_id: None,
         call_id: payload_object
             .get("call_id")
@@ -367,6 +375,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
 
     let mut session_meta_payload = Map::new();
     session_meta_payload.insert("id".to_string(), Value::String(session_id.clone()));
+    session_meta_payload.insert("session_id".to_string(), Value::String(session_id.clone()));
     session_meta_payload.insert(
         "timestamp".to_string(),
         Value::String(created_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -378,10 +387,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .unwrap_or_else(|| "transession".to_string())
             .into(),
     );
-    session_meta_payload.insert(
-        "cli_version".to_string(),
-        codex_cli_version(&session.metadata).into(),
-    );
+    session_meta_payload.insert("cli_version".to_string(), CODEX_CLI_VERSION.into());
     session_meta_payload.insert(
         "source".to_string(),
         session
@@ -389,32 +395,20 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .extra
             .get("codex_source")
             .cloned()
-            .unwrap_or_else(|| Value::String("import".to_string())),
+            .unwrap_or_else(|| Value::String("cli".to_string())),
     );
     session_meta_payload.insert(
         "model_provider".to_string(),
-        Value::String(exported_codex_model_provider()),
+        Value::String(CODEX_MODEL_PROVIDER.to_string()),
     );
-    session_meta_payload.insert(
-        "base_instructions".to_string(),
-        json!({
-            "text": extra_string(&session.metadata, "codex_base_instructions").unwrap_or_else(|| {
-                format!(
-                    "Imported by transession from {} session {}.",
-                    session
-                        .metadata
-                        .source_format
-                        .map(format_name)
-                        .unwrap_or("unknown"),
-                    session
-                        .metadata
-                        .original_session_id
-                        .clone()
-                        .unwrap_or_else(|| session.metadata.session_id.clone()),
-                )
-            })
-        }),
-    );
+    session_meta_payload.insert("thread_source".to_string(), "user".into());
+    session_meta_payload.insert("history_mode".to_string(), "legacy".into());
+    if let Some(base_instructions) = extra_string(&session.metadata, "codex_base_instructions") {
+        session_meta_payload.insert(
+            "base_instructions".to_string(),
+            json!({ "text": base_instructions }),
+        );
+    }
 
     write_json_line(
         &mut file,
@@ -435,9 +429,14 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
 
                 if message.role == "user" {
                     close_turn(&mut file, &mut active_turn, updated_at)?;
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, timestamp)?);
                     write_message_response_item(&mut file, message, updated_at)?;
-                    if let Some(text) = rendered_text {
+                    let images = message
+                        .blocks
+                        .iter()
+                        .filter_map(codex_image_url)
+                        .collect::<Vec<_>>();
+                    if rendered_text.is_some() || !images.is_empty() {
                         write_json_line(
                             &mut file,
                             &json!({
@@ -445,8 +444,8 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                                 "type": "event_msg",
                                 "payload": {
                                     "type": "user_message",
-                                    "message": text,
-                                    "images": [],
+                                    "message": rendered_text.unwrap_or_default(),
+                                    "images": images,
                                     "local_images": [],
                                     "text_elements": [],
                                 }
@@ -460,7 +459,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 }
 
                 if message.role != "developer" && active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, timestamp)?);
                 }
 
                 if message.role == "assistant"
@@ -491,7 +490,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::Reasoning(reasoning) => {
                 let timestamp = reasoning.timestamp.unwrap_or(updated_at);
                 if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, timestamp)?);
                 }
 
                 let summary_text = render_reasoning_text(reasoning);
@@ -531,7 +530,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::ToolCall(call) => {
                 let timestamp = call.timestamp.unwrap_or(updated_at);
                 if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, timestamp)?);
                 }
                 write_json_line(
                     &mut file,
@@ -554,7 +553,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             SessionEvent::ToolResult(result) => {
                 let timestamp = result.timestamp.unwrap_or(updated_at);
                 if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    active_turn = Some(start_turn(&mut file, timestamp)?);
                 }
                 write_json_line(
                     &mut file,
@@ -762,21 +761,6 @@ fn codex_session_id(candidate: &str) -> String {
     }
 }
 
-fn codex_cli_version(metadata: &SessionMetadata) -> String {
-    if metadata.source_format == Some(SessionFormat::Codex) {
-        metadata
-            .platform_version
-            .clone()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
-    } else {
-        env!("CARGO_PKG_VERSION").to_string()
-    }
-}
-
-fn local_timezone_name_or_offset() -> String {
-    std::env::var("TZ").unwrap_or_else(|_| Local::now().offset().to_string())
-}
-
 fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> String {
     if session.metadata.source_format == Some(SessionFormat::Codex) {
         return derive_title(session).unwrap_or_else(|| session_id.to_string());
@@ -784,27 +768,9 @@ fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> S
     session_id.to_string()
 }
 
-fn exported_codex_model_provider() -> String {
-    "imported".to_string()
-}
-
-fn exported_codex_collaboration_mode() -> Value {
-    json!({ "mode": "default" })
-}
-
-fn start_turn(
-    file: &mut impl Write,
-    metadata: &SessionMetadata,
-    cwd: &Path,
-    timestamp: DateTime<Utc>,
-) -> Result<ActiveTurn> {
+fn start_turn(file: &mut impl Write, timestamp: DateTime<Utc>) -> Result<ActiveTurn> {
     let turn_id = Uuid::now_v7().to_string();
     let rendered_timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
-    let collaboration_mode = exported_codex_collaboration_mode();
-    let collaboration_mode_kind = collaboration_mode
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("default");
 
     write_json_line(
         file,
@@ -815,16 +781,8 @@ fn start_turn(
                 "type": "task_started",
                 "turn_id": turn_id,
                 "model_context_window": 950000,
-                "collaboration_mode_kind": collaboration_mode_kind,
+                "collaboration_mode_kind": "default",
             }
-        }),
-    )?;
-    write_json_line(
-        file,
-        &json!({
-            "timestamp": rendered_timestamp,
-            "type": "turn_context",
-            "payload": build_turn_context_payload(metadata, cwd, &turn_id, timestamp),
         }),
     )?;
 
@@ -858,66 +816,6 @@ fn close_turn(
     )
 }
 
-fn build_turn_context_payload(
-    metadata: &SessionMetadata,
-    cwd: &Path,
-    turn_id: &str,
-    timestamp: DateTime<Utc>,
-) -> Map<String, Value> {
-    let mut turn_context_payload = Map::new();
-    turn_context_payload.insert("turn_id".to_string(), Value::String(turn_id.to_string()));
-    turn_context_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
-    turn_context_payload.insert(
-        "current_date".to_string(),
-        extra_string(metadata, "codex_current_date")
-            .unwrap_or_else(|| {
-                timestamp
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d")
-                    .to_string()
-            })
-            .into(),
-    );
-    turn_context_payload.insert(
-        "timezone".to_string(),
-        extra_string(metadata, "codex_timezone")
-            .unwrap_or_else(local_timezone_name_or_offset)
-            .into(),
-    );
-    turn_context_payload.insert(
-        "approval_policy".to_string(),
-        metadata
-            .extra
-            .get("codex_approval_policy")
-            .cloned()
-            .unwrap_or_else(|| Value::String("on-request".to_string())),
-    );
-    turn_context_payload.insert(
-        "sandbox_policy".to_string(),
-        metadata
-            .extra
-            .get("codex_sandbox_policy")
-            .cloned()
-            .unwrap_or_else(|| json!({ "type": "workspace-write" })),
-    );
-    turn_context_payload.insert(
-        "personality".to_string(),
-        metadata
-            .extra
-            .get("codex_personality")
-            .cloned()
-            .unwrap_or_else(|| Value::String("pragmatic".to_string())),
-    );
-    turn_context_payload.insert(
-        "collaboration_mode".to_string(),
-        exported_codex_collaboration_mode(),
-    );
-    if let Some(user_instructions) = metadata.extra.get("codex_user_instructions") {
-        turn_context_payload.insert("user_instructions".to_string(), user_instructions.clone());
-    }
-    turn_context_payload
-}
-
 fn write_message_response_item(
     file: &mut impl Write,
     message: &MessageEvent,
@@ -927,13 +825,20 @@ fn write_message_response_item(
         .blocks
         .iter()
         .filter_map(|block| {
-            let text = block.text.clone()?;
-            let mapped_kind = codex_block_kind(&message.role, &block.kind);
             let mut object = Map::new();
-            object.insert("type".to_string(), Value::String(mapped_kind.to_string()));
-            object.insert("text".to_string(), Value::String(text));
-            if let Some(Value::Object(extra)) = &block.data {
-                object.extend(extra.clone());
+            if let Some(text) = &block.text {
+                object.insert(
+                    "type".to_string(),
+                    Value::String(codex_block_kind(&message.role, &block.kind).to_string()),
+                );
+                object.insert("text".to_string(), Value::String(text.clone()));
+                if let Some(Value::Object(extra)) = &block.data {
+                    object.extend(extra.clone());
+                }
+            } else {
+                let image_url = codex_image_url(block)?;
+                object.insert("type".to_string(), Value::String("input_image".to_string()));
+                object.insert("image_url".to_string(), Value::String(image_url));
             }
             Some(Value::Object(object))
         })
@@ -955,6 +860,33 @@ fn write_message_response_item(
             }
         }),
     )
+}
+
+fn codex_image_url(block: &ContentBlock) -> Option<String> {
+    let data = block.data.as_ref()?;
+    if block.kind == "input_image" {
+        return data
+            .get("image_url")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    if block.kind != "image" {
+        return None;
+    }
+
+    let source = data.get("source")?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => Some(format!(
+            "data:{};base64,{}",
+            source.get("media_type")?.as_str()?,
+            source.get("data")?.as_str()?
+        )),
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 fn render_message_text(message: &MessageEvent) -> Option<String> {
@@ -1026,7 +958,7 @@ fn register_thread_in_sqlite(
         .unwrap_or_else(|| "{\"type\":\"workspace-write\"}".to_string());
     let approval_mode = extra_string(&session.metadata, "codex_approval_policy")
         .unwrap_or_else(|| "on-request".to_string());
-    let model_provider = exported_codex_model_provider();
+    let model_provider = CODEX_MODEL_PROVIDER;
     let git_branch = session.metadata.git_branch.clone();
     let has_user_event = session
         .events
@@ -1088,11 +1020,17 @@ fn register_thread_in_sqlite(
                 approval_mode,
                 has_user_event,
                 git_branch,
-                codex_cli_version(&session.metadata),
+                CODEX_CLI_VERSION,
                 first_user_message,
             ],
         )
         .with_context(|| format!("failed to register thread {} in {}", session_id, sqlite_path.display()))?;
+
+    // Codex 0.144+ hides rows without a preview; older state DBs lack these columns.
+    let _ = connection.execute(
+        "UPDATE threads SET preview = ?1, thread_source = 'user', history_mode = 'legacy' WHERE id = ?2",
+        params![first_user_message, session_id],
+    );
 
     Ok(())
 }
@@ -1112,12 +1050,4 @@ fn first_user_message(session: &UniversalSession) -> Option<String> {
             .map(collapse_whitespace)
             .find(|text| !text.is_empty())
     })
-}
-
-fn format_name(format: SessionFormat) -> &'static str {
-    match format {
-        SessionFormat::Ir => "IR",
-        SessionFormat::Codex => "Codex",
-        SessionFormat::Claude => "Claude",
-    }
 }

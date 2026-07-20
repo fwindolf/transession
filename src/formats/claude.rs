@@ -13,6 +13,8 @@ use crate::ir::{
     ToolCallEvent, ToolResultEvent, UniversalSession,
 };
 
+const CLAUDE_CODE_VERSION: &str = "2.1.215";
+
 pub struct ClaudeMaterialization {
     pub session_file: PathBuf,
     pub history_file: Option<PathBuf>,
@@ -35,6 +37,11 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
         let value: Value = serde_json::from_str(&line)
             .with_context(|| format!("invalid JSONL in {}", path.display()))?;
         import_metadata(&mut session.metadata, &value);
+        if value.get("isMeta").and_then(Value::as_bool) == Some(true)
+            || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
 
         match value.get("type").and_then(Value::as_str) {
             Some("user") => import_user_entry(&mut session.events, &value),
@@ -64,6 +71,13 @@ fn import_metadata(metadata: &mut SessionMetadata, value: &Value) {
     }
     if let Some(version) = value.get("version").and_then(Value::as_str) {
         metadata.platform_version = Some(version.to_string());
+    }
+    if let Some(model) = value
+        .get("message")
+        .and_then(|message| message.get("model"))
+        .and_then(Value::as_str)
+    {
+        metadata.model = Some(model.to_string());
     }
     let timestamp = value
         .get("timestamp")
@@ -380,15 +394,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .filter_map(SessionEvent::timestamp)
             .min()
     });
-    let version = if session.metadata.source_format == Some(SessionFormat::Claude) {
-        session
-            .metadata
-            .platform_version
-            .clone()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
-    } else {
-        env!("CARGO_PKG_VERSION").to_string()
-    };
+    let version = CLAUDE_CODE_VERSION;
 
     let mut file = File::create(&materialization.session_file).with_context(|| {
         format!(
@@ -416,6 +422,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "parentUuid": previous_uuid,
                         "isSidechain": false,
                         "userType": "external",
+                        "entrypoint": "cli",
                         "cwd": cwd,
                         "sessionId": session_id,
                         "version": version,
@@ -430,6 +437,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "parentUuid": previous_uuid,
                         "isSidechain": false,
                         "userType": "external",
+                        "entrypoint": "cli",
                         "cwd": cwd,
                         "sessionId": session_id,
                         "version": version,
@@ -466,6 +474,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "parentUuid": previous_uuid,
                     "isSidechain": false,
                     "userType": "external",
+                    "entrypoint": "cli",
                     "cwd": cwd,
                     "sessionId": session_id,
                     "version": version,
@@ -485,7 +494,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "type": "tool_use",
                         "id": call.call_id,
                         "name": call.name,
-                        "input": call.arguments,
+                        "input": encode_tool_input(&call.arguments),
                         "caller": { "type": "direct" },
                     }]),
                     Value::String("tool_use".to_string()),
@@ -494,6 +503,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "parentUuid": previous_uuid,
                     "isSidechain": false,
                     "userType": "external",
+                    "entrypoint": "cli",
                     "cwd": cwd,
                     "sessionId": session_id,
                     "version": version,
@@ -514,6 +524,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "parentUuid": previous_uuid,
                     "isSidechain": false,
                     "userType": "external",
+                    "entrypoint": "cli",
                     "cwd": cwd,
                     "sessionId": session_id,
                     "version": version,
@@ -616,6 +627,16 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
     let encoded = blocks
         .iter()
         .map(|block| {
+            if block.kind == "input_image"
+                && let Some(image_url) = block
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("image_url"))
+                    .and_then(Value::as_str)
+            {
+                return encode_claude_image(image_url);
+            }
+
             let mut object = Map::new();
             object.insert(
                 "type".to_string(),
@@ -656,12 +677,61 @@ fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
     Value::Object(message)
 }
 
+fn encode_tool_input(input: &Value) -> Value {
+    match input {
+        Value::Object(_) => input.clone(),
+        input => json!({ "input": input }),
+    }
+}
+
 fn encode_tool_result_output(output: &Value) -> Value {
     match output {
-        Value::Array(_) | Value::Object(_) => output.clone(),
         Value::String(text) => Value::String(text.clone()),
-        other => Value::String(other.to_string()),
+        Value::Array(items) if !items.is_empty() => {
+            let mut encoded = Vec::with_capacity(items.len());
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text") => encoded.push(json!({
+                        "type": "text",
+                        "text": item.get("text").and_then(Value::as_str).unwrap_or_default(),
+                    })),
+                    Some("input_image") => {
+                        let Some(image_url) = item.get("image_url").and_then(Value::as_str) else {
+                            return Value::String(json_to_string(output));
+                        };
+                        encoded.push(encode_claude_image(image_url));
+                    }
+                    Some("text" | "image" | "document") => encoded.push(item.clone()),
+                    _ => return Value::String(json_to_string(output)),
+                }
+            }
+            Value::Array(encoded)
+        }
+        other => Value::String(json_to_string(other)),
     }
+}
+
+fn encode_claude_image(image_url: &str) -> Value {
+    if let Some(data_url) = image_url.strip_prefix("data:")
+        && let Some((media_type, data)) = data_url.split_once(";base64,")
+    {
+        return json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            }
+        });
+    }
+
+    json!({
+        "type": "image",
+        "source": {
+            "type": "url",
+            "url": image_url,
+        }
+    })
 }
 
 fn tool_result_summary(output: &Value, is_error: bool) -> Value {
@@ -795,6 +865,7 @@ fn project_message_for_claude(message: &MessageEvent) -> (&'static str, Vec<Cont
 fn claude_block_kind(kind: &str) -> &'static str {
     match kind {
         "thinking" => "thinking",
+        "image" => "image",
         "tool_use" => "tool_use",
         "tool_result" => "tool_result",
         "input_text" | "output_text" | "text" => "text",

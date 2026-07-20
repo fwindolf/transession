@@ -2,6 +2,9 @@
 
 `transession` translates interactive session history between Codex and Claude Code.
 
+> [!IMPORTANT]
+> **Tested compatibility (2026-07-20):** Codex CLI [`0.144.6`](https://github.com/openai/codex/releases/tag/rust-v0.144.6) and Claude Code [`2.1.215`](https://github.com/anthropics/claude-code/releases/tag/v2.1.215), in both directions. If either installed CLI is newer, its private session format is not yet verified against this version of `transession`.
+
 The default workflow is direct native-to-native conversion by session id:
 
 ```bash
@@ -156,7 +159,7 @@ What you need to do before the real publish:
 How to run the publish workflow:
 
 - For a dry run in GitHub Actions: open the `publish` workflow and run `workflow_dispatch` with `dry_run=true`.
-- For a real publish in GitHub Actions: run `workflow_dispatch` with `dry_run=false`, or push a tag like `v0.1.2`.
+- For a real publish in GitHub Actions: run `workflow_dispatch` with `dry_run=false`, or push a tag like `v0.1.3`.
 
 The publish workflow will:
 
