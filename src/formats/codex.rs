@@ -15,7 +15,7 @@ use crate::ir::{
 };
 
 const CODEX_CLI_VERSION: &str = "0.144.6";
-const CODEX_MODEL_PROVIDER: &str = "OpenAI";
+const CODEX_MODEL_PROVIDER: &str = "openai";
 
 pub struct CodexMaterialization {
     pub session_file: PathBuf,

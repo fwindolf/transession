@@ -349,7 +349,7 @@ fn materialized_codex_sessions_include_turn_events() {
             .get("payload")
             .and_then(|value| value.get("model_provider"))
             .and_then(|value| value.as_str()),
-        Some("OpenAI")
+        Some("openai")
     );
     assert_eq!(
         session_meta

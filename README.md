@@ -28,29 +28,33 @@ transession --from codex --to claude <SESSION_ID> --no-open
 
 ## Install
 
+Install the tagged release from this fork:
+
+```bash
+cargo install --git https://github.com/fwindolf/transession.git --tag v0.1.3 --locked
+```
+
+The upstream crates.io release remains available separately:
+
 ```bash
 cargo install transession
 ```
 
-Or install directly from GitHub:
+Or install from a local checkout:
 
 ```bash
-cargo install --git https://github.com/inmzhang/transession.git
-```
-
-Or from a local checkout:
-
-```bash
-cargo install --path .
+cargo install --path . --locked
 ```
 
 For development:
 
 ```bash
-git clone https://github.com/inmzhang/transession.git
+git clone https://github.com/fwindolf/transession.git
 cd transession
-cargo build --release
+cargo build --release --locked
 ```
+
+To release a new version, update the version in `Cargo.toml` and `Cargo.lock`, merge it into `master`, then push a matching tag such as `v0.1.3`. The release workflow validates, tests, installs, and creates the GitHub Release.
 
 ## Quick Start
 
