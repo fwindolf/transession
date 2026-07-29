@@ -54,7 +54,7 @@ cd transession
 cargo build --release --locked
 ```
 
-To release a new version, update the version in `Cargo.toml` and `Cargo.lock`, merge it into `master`, then push a matching tag such as `v0.1.3`. The release workflow validates, tests, installs, and creates the GitHub Release.
+To release a new version, update the version in `Cargo.toml` and `Cargo.lock`, merge it into `main`, then push a matching tag such as `v0.1.3`. The release workflow validates, tests, installs, and creates the GitHub Release.
 
 ## Quick Start
 
